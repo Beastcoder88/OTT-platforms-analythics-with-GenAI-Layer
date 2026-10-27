@@ -1,0 +1,5 @@
+.env
+__pycache__/
+data/generated/
+data/sql_cache.json
+data/raw/
