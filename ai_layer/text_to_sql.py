@@ -140,35 +140,66 @@ def _forget(question):
 
 # ---------- Connections ----------
 def get_engine():
-    """Connect with the READ-ONLY MySQL user. This is the real safety net."""
+    """Connect with the READ-ONLY MySQL user, or fall back to local SQLite if MySQL is not available."""
     global _engine
-    if _engine is None:
-        user = os.getenv("AI_DB_USER")
-        password = os.getenv("AI_DB_PASSWORD")
-        if not user or not password:
-            raise RuntimeError("AI_DB_USER and AI_DB_PASSWORD are missing in .env (use the read-only MySQL user).")
-        if user.lower() == "root":
-            raise RuntimeError("Do not use root here. Create and use the read-only user (pbi_reader).")
-        url = URL.create(
-            "mysql+pymysql",
-            username=user,
-            password=password,
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", "3306")),
-            database=os.getenv("DB_NAME", "ott_analytics"),
-            query={"charset": "utf8mb4"},
-        )
-        engine = create_engine(url, pool_pre_ping=True)
+    if _engine is not None:
+        return _engine
+
+    user = os.getenv("AI_DB_USER")
+    password = os.getenv("AI_DB_PASSWORD")
+    if user and password and user.lower() != "root":
+        try:
+            url = URL.create(
+                "mysql+pymysql",
+                username=user,
+                password=password,
+                host=os.getenv("DB_HOST", "localhost"),
+                port=int(os.getenv("DB_PORT", "3306")),
+                database=os.getenv("DB_NAME", "ott_analytics"),
+                query={"charset": "utf8mb4"},
+            )
+            engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 2})
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+
+            @event.listens_for(engine, "connect")
+            def _restrict_session(dbapi_conn, _record):
+                cur = dbapi_conn.cursor()
+                cur.execute("SET SESSION TRANSACTION READ ONLY")
+                cur.execute("SET SESSION MAX_EXECUTION_TIME=10000")   # 10 seconds
+                cur.close()
+
+            _engine = engine
+            return _engine
+        except Exception:
+            pass
+
+    # Fallback to local SQLite database
+    db_file = Path(__file__).resolve().parent.parent / "ott_analytics.db"
+    if db_file.exists():
+        engine = create_engine(f"sqlite:///{db_file}")
 
         @event.listens_for(engine, "connect")
-        def _restrict_session(dbapi_conn, _record):
-            cur = dbapi_conn.cursor()
-            cur.execute("SET SESSION TRANSACTION READ ONLY")
-            cur.execute("SET SESSION MAX_EXECUTION_TIME=10000")   # 10 seconds
-            cur.close()
+        def _register_sqlite_functions(dbapi_conn, _record):
+            def _date_format(val, fmt):
+                if not val:
+                    return None
+                from datetime import datetime
+                s = str(val).split(".")[0]
+                for p in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        py_fmt = str(fmt).replace("%i", "%M").replace("%s", "%S")
+                        return datetime.strptime(s, p).strftime(py_fmt)
+                    except ValueError:
+                        pass
+                return str(val)
+
+            dbapi_conn.create_function("DATE_FORMAT", 2, _date_format)
 
         _engine = engine
-    return _engine
+        return _engine
+
+    raise RuntimeError("Database could not be reached. Neither MySQL nor local ott_analytics.db is available.")
 
 
 def get_schema():
@@ -191,23 +222,38 @@ def _call_model(prompt):
     from google.genai import types
 
     client = _get_client()
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0),
-            )
-            return (response.text or "").strip()
-        except Exception as e:
-            message = str(e)
-            # Daily quota errors generally will not be fixed by a short retry.
-            if "PerDay" in message:
-                raise
-            if "429" in message and attempt < 2:
-                time.sleep(15 * (attempt + 1))    # retry transient per-minute limits
-                continue
-            raise
+    candidate_models = [MODEL, "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+    # Deduplicate while preserving order
+    models_to_try = []
+    for m in candidate_models:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+
+    last_exc = None
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0),
+                )
+                return (response.text or "").strip()
+            except Exception as e:
+                last_exc = e
+                message = str(e)
+                if "PerDay" in message:
+                    raise
+                if "429" in message and attempt < 1:
+                    time.sleep(3)
+                    continue
+                # If model is 503 Unavailable or 404 Not Found, break to next candidate model
+                if "503" in message or "404" in message:
+                    break
+
+    if last_exc:
+        raise last_exc
+    return ""
 
 
 def clean_sql(raw):
@@ -220,11 +266,20 @@ def clean_sql(raw):
 
 
 def generate_sql(question):
+    norm_q = re.sub(r"\s+([?.!])", r"\1", question.strip())
     if question in _sql_cache:
         return _sql_cache[question]
-    prompt = f"{get_schema()}\n{EXAMPLES}\nQuestion: {question}\nSQL:"
+    if norm_q in _sql_cache:
+        return _sql_cache[norm_q]
+    for cached_q, sql in _sql_cache.items():
+        if cached_q.strip().lower() == norm_q.lower():
+            return sql
+
+    prompt = f"{get_schema()}\n{EXAMPLES}\nQuestion: {norm_q}\nSQL:"
     sql = clean_sql(_call_model(prompt))
-    _remember(question, sql)
+    _remember(norm_q, sql)
+    if norm_q != question:
+        _remember(question, sql)
     return sql
 
 
@@ -274,15 +329,27 @@ def run_query(sql):
 # ---------- The whole pipeline ----------
 def ask(question):
     """Run question -> SQL -> checks -> database. Never raises; returns a dict for the UI."""
-    q = (question or "").strip()
-    result = {"question": q, "sql": None, "df": None, "truncated": False,
-              "error": None, "refused": False, "repaired": False, "detail": None}
+    raw_q = (question or "").strip()
+    q = re.sub(r"\s+([?.!])", r"\1", raw_q)
+    result = {"question": raw_q, "sql": None, "df": None, "truncated": False,
+              "error": None, "refused": False, "repaired": False, "detail": None,
+              "is_greeting": False, "message": None}
 
     if not q:
         result["error"] = "Please type a question."
         return result
     if len(q) > MAX_QUESTION_CHARS:
         result["error"] = f"Please keep the question under {MAX_QUESTION_CHARS} characters."
+        return result
+
+    # Friendly greeting / help handling
+    cleaned_greeting = re.sub(r"[^\w\s]", "", q.lower()).strip()
+    if cleaned_greeting in {"hello", "hi", "hey", "help", "who are you", "what can you do", "namaste", "good morning", "good evening"}:
+        result["is_greeting"] = True
+        result["message"] = (
+            "👋 Hello! I am your OTT Analytics assistant. Ask me questions about watch time, "
+            "subscribers, churn, genres, regions, or devices (e.g., 'How many hours were watched in each region?')."
+        )
         return result
 
     try:
